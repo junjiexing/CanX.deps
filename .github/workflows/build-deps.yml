@@ -1,0 +1,282 @@
+name: Build native dependencies
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deps-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: ${{ matrix.architecture == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, arm64]
+    env:
+      CANX_LINUX_ARCHITECTURE: ${{ matrix.architecture }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Free hosted runner space for native compilation
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h .
+
+      - name: Cache pinned sources and native build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/static-native-ubuntu22.04
+            .cache/native/quickjs
+          key: deps-linux-${{ matrix.architecture }}-jammy-v1-${{ hashFiles('native/sources-linux-x64.lock', 'native/quickjs-source.lock', 'native/aria2-shim/**', 'native/quickjs-shim/**', 'native/patches/**', 'native/linux-x64-ubuntu22.04.Dockerfile', 'scripts/*linux*.sh', 'scripts/support/linux-architecture.sh') }}
+
+      - name: Build dependencies, shims and metadata in Ubuntu 22.04
+        run: |
+          scripts/run-ubuntu-22.04-linux-x64.sh bash -lc '
+            set -euo pipefail
+            scripts/build-static-native-linux-x64.sh all
+            scripts/build-linux-shims.sh
+            scripts/collect-release-metadata.sh
+          '
+
+      - name: Package dependency archives
+        run: scripts/package-deps-linux.sh
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deps-linux-${{ matrix.architecture }}
+          path: artifacts/deps/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [x64, arm64]
+    env:
+      ARCHITECTURE: ${{ matrix.architecture }}
+      NATIVE_CACHE: .cache/windows-msvc-${{ matrix.architecture }}
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.cache/vcpkg-binaries
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Cache native dependency build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NATIVE_CACHE }}
+          key: deps-windows-2022-${{ matrix.architecture }}-v2-${{ hashFiles('native/sources-windows-x64.lock', 'native/quickjs-source.lock', 'native/aria2-shim/**', 'native/quickjs-shim/**', 'native/patches/**', 'native/windows-*/**', 'scripts/build-static-native-windows-x64.ps1', 'scripts/support/**') }}
+
+      - name: Install MSYS2 Autotools frontend
+        shell: pwsh
+        run: |
+          & C:/msys64/usr/bin/bash.exe -lc 'pacman -Sy --noconfirm --needed autoconf automake gettext-devel libtool make pkgconf diffutils patch'
+          if ($LASTEXITCODE -ne 0) { throw 'MSYS2 build tools could not be installed.' }
+
+      - name: Restore vcpkg binary packages
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/vcpkg-binaries
+          key: deps-vcpkg-windows-2022-${{ matrix.architecture }}-${{ hashFiles('native/sources-windows-x64.lock', 'native/windows-*/vcpkg.json') }}
+          restore-keys: |
+            deps-vcpkg-windows-2022-${{ matrix.architecture }}-
+
+      - name: Build all native dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          ./scripts/build-static-native-windows-x64.ps1 -Component All -Architecture $env:ARCHITECTURE -CacheRoot $env:NATIVE_CACHE -Jobs 2
+
+      - name: Save completed vcpkg packages
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .cache/vcpkg-binaries
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Package dependency archive
+        shell: pwsh
+        run: ./scripts/package-deps-windows.ps1 -Architecture $env:ARCHITECTURE -CacheRoot $env:NATIVE_CACHE
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deps-windows-${{ matrix.architecture }}
+          path: artifacts/deps/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    env:
+      ABI: ${{ matrix.abi }}
+      CANX_BUILD_JOBS: '2'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Free hosted runner space for native compilation
+        run: |
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/local/.ghcup
+          df -h .
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake autopoint gettext build-essential cmake gperf libtool ninja-build pkg-config python3-pip nasm unzip zip
+          python3 -m pip install --target .cache/python-tools meson==1.9.1
+
+      - name: Cache pinned sources, SDK and native outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/upstream
+            .cache/native/quickjs
+            .cache/android-native/${{ matrix.abi }}
+            .cache/android-sdk
+            .cache/dotnet
+            .cache/jdk
+          key: deps-android-${{ matrix.abi }}-v1-${{ hashFiles('native/sources-linux-x64.lock', 'native/quickjs-source.lock', 'native/aria2-shim/**', 'native/quickjs-shim/**', 'native/patches/**', 'scripts/*android*') }}
+
+      - name: Install Android SDK and NDK
+        run: scripts/prepare-android-workload.sh > /dev/null
+
+      - name: Build pinned sources and native libraries
+        run: |
+          ndk="$(scripts/prepare-android-workload.sh | tail -n 1)"
+          scripts/prepare-android-sources.sh
+          ANDROID_NDK_ROOT="$ndk" scripts/build-static-native-android.sh "$ABI" all
+
+      - name: Package dependency archive
+        run: scripts/package-deps-android.sh "$ABI"
+
+      - name: Upload Android packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deps-android-${{ matrix.abi }}
+          path: artifacts/deps/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      # Binaries must match the Info.plist LSMinimumSystemVersion (13.0)
+      # rather than the runner image's macOS version.
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      - name: Cache pinned sources and native build outputs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .cache/upstream
+            .cache/native/quickjs
+            .cache/mac-native
+            .cache/macos
+            .cache/macos-build-venv
+          key: deps-macos-15-v1-${{ hashFiles('native/sources-linux-x64.lock', 'native/quickjs-source.lock', 'native/aria2-shim/**', 'native/quickjs-shim/**', 'native/patches/**', 'scripts/build-macos-*') }}
+
+      - name: Install build tools and native runtime dependencies
+        run: |
+          set -euo pipefail
+          brew install autoconf automake libtool cmake ninja pkg-config \
+            openssl@3 sqlite libssh2 c-ares
+
+      - name: Build mpv frameworks and shims
+        run: |
+          set -euo pipefail
+          scripts/build-macos-mpv-frameworks.sh
+          scripts/build-macos-shims.sh
+
+      - name: Package dependency archive
+        run: scripts/package-deps-macos.sh
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deps-macos-arm64
+          path: artifacts/deps/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  release:
+    name: Publish dependency release
+    needs: [linux, windows, android, macos]
+    if: >-
+      always() && !cancelled() &&
+      needs.linux.result == 'success' && needs.windows.result == 'success' &&
+      needs.android.result == 'success' && needs.macos.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download completed platform packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: deps-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.gz)
+          if (( ${#assets[@]} == 0 )); then
+            echo 'No dependency packages completed successfully.' >&2
+            exit 1
+          fi
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            tag="$GITHUB_REF_NAME"
+            prerelease=()
+          else
+            tag=dev
+            prerelease=(--prerelease)
+          fi
+          # Rolling development releases are replaced so the dev tag always
+          # points at the latest successful main build; tag releases are
+          # immutable and only receive their assets once.
+          if [[ "$tag" == dev ]]; then
+            gh release delete dev --yes --cleanup-tag 2>/dev/null || true
+            gh release create dev --title 'Native dependencies (rolling development build)' \
+              --notes "Built from ${GITHUB_SERVER_URL}/${GH_REPO}/commit/${GITHUB_SHA}" \
+              "${prerelease[@]}" "${assets[@]}" dist/SHA256SUMS
+          else
+            gh release create "$tag" --title "Native dependencies $tag" \
+              --notes "Built from ${GITHUB_SERVER_URL}/${GH_REPO}/commit/${GITHUB_SHA}" \
+              "${prerelease[@]}" "${assets[@]}" dist/SHA256SUMS || \
+            gh release upload "$tag" "${assets[@]}" dist/SHA256SUMS --clobber
+          fi

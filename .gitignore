@@ -1,0 +1,18 @@
+# Native build outputs
+.cache/
+artifacts/
+build/
+cmake-build-*/
+
+# IDE and user-local state
+.idea/
+.vs/
+.vscode/
+*.user
+*.suo
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+Thumbs.db
