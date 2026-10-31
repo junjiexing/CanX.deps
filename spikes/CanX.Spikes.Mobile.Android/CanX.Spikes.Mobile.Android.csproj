@@ -14,7 +14,9 @@
     <WarningsNotAsErrors>$(WarningsNotAsErrors);IL3053</WarningsNotAsErrors>
   </PropertyGroup>
 
+  <!-- This repository has no central package management; the version is pinned
+       inline and only serves Android SDK/NDK provisioning. -->
   <ItemGroup>
-    <PackageReference Include="Avalonia.Android" />
+    <PackageReference Include="Avalonia.Android" Version="12.1.2" />
   </ItemGroup>
 </Project>
