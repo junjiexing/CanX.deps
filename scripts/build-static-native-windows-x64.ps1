@@ -341,9 +341,14 @@ function Build-Zimg {
     $lib = Join-Path $prefix 'lib'
     $include = Join-Path $prefix 'include'
     New-Item -ItemType Directory -Force -Path $build, $lib, $include | Out-Null
+    # WholeProgramOptimization (/GL) embeds references to compiler-generated
+    # files at build-machine paths; the resulting library only links on the
+    # machine that produced it. The package is consumed by CanX CI runners,
+    # so LTCG must stay off.
     Invoke-Checked $msbuild @(
         (Join-Path $source '_msvc\zimg\zimg.vcxproj'),
         '/m', '/t:Rebuild', '/p:Configuration=Release', "/p:Platform=$cmakePlatform",
+        '/p:WholeProgramOptimization=false',
         "/p:OutDir=$lib\", "/p:IntDir=$build\obj\")
     Copy-Item -LiteralPath (Join-Path $source 'src\zimg\api\zimg.h') -Destination $include -Force
     Copy-Item -LiteralPath (Join-Path $source 'src\zimg\api\zimg++.hpp') -Destination $include -Force
